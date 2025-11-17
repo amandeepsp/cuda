@@ -11,6 +11,7 @@ class FusedTiledMatmul:
         acc_dtype: Type[cute.Numeric] = cute.Float32,
         block_tiler: Tuple[int, int, int] = (128, 128, 8),
         num_threads=256,
+        num_vectorize_copy=4,
     ):
         self.block_tiler = block_tiler
         self.num_threads = num_threads
@@ -24,6 +25,7 @@ class FusedTiledMatmul:
         )
 
         self.acc_dtype = acc_dtype
+        self.num_vectorize_copy = num_vectorize_copy
 
     @no_type_check
     @cute.kernel
@@ -77,6 +79,7 @@ class FusedTiledMatmul:
         # tAcB = current thread's partition of cB - (cpy, cpy_n, cpy_k) -> (n_idx, k_idx)
         # tApA = predicate tensor for all but last tAsA - (rest_v, cpy_m, cpy_k), stride=(cpy_m, 1, 0)
         # tBpB = predicate tensor for all but last tBsB - (rest_v, cpy_n, cpy_k), stride=(cpy_n, 1, 0)
+        # tApA, tBpB are shared across all k_tiles since stride of k mode = 0, same values are used for all k
         # tApA_residue_k = predicate tensor for last tAsA - (rest_v, cpy_m, cpy_k), stride=(cpy_m * cpy_k, cpy_k, 1)
         # tBpB_residue_k = predicate tensor for last tBsB - (rest_v, cpy_n, cpy_k), stride=(cpy_n * cpy_k, cpy_k, 1)
 
@@ -201,6 +204,9 @@ class FusedTiledMatmul:
             else:
                 cute.copy(tiled_copy_A, tAgA[None, None, None, k], tAsA, pred=tApA)
                 cute.copy(tiled_copy_B, tBgB[None, None, None, k], tBsB, pred=tBpB)
+
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
 
             cute.gemm(tiled_mma, tCrC, tCsA, tCsB, tCrC)
@@ -240,21 +246,24 @@ class FusedTiledMatmul:
         vA = cute.make_layout((1, 1))
 
         copy_atom_A = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
+            cute.nvgpu.cpasync.CopyG2SOp(),
             mA.element_type,
             num_bits_per_copy=mA.element_type.width,
         )
 
+        num_vectorized = self.num_vectorize_copy if (mB.layout[0].max_alignment % 16 == 0) else 1
         copy_atom_B = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
+            cute.nvgpu.cpasync.CopyG2SOp(),
             mA.element_type,
-            num_bits_per_copy=mB.element_type.width,
+            num_bits_per_copy=mB.element_type.width * num_vectorized,
         )
-
+        major_mode_size = self.b_n // num_vectorized
         tB = cute.make_layout(
-            (self.num_threads // self.b_k, self.b_k), stride=(self.b_k, 1)
+            (major_mode_size, self.num_threads // major_mode_size),
+            stride=(1, major_mode_size),
         )
-        vB = cute.make_layout((1, 1))
+        vB = cute.make_layout((num_vectorized, 1))
+
 
         tiled_copy_A = cute.make_tiled_copy_tv(
             copy_atom_A, thr_layout=tA, val_layout=vA

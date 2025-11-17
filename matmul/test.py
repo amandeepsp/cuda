@@ -7,17 +7,16 @@ from fmma_tiled_matmul import FusedTiledMatmul
 
 torch.manual_seed(42)
 
-M, L, N = 8192, 4096, 8192
+M, L, N = 2000, 1000, 2000
 
 a = torch.randn(M, L, device="cuda", dtype=torch.float32)
 b = torch.randn(L, N, device="cuda", dtype=torch.float32)
-bT = b.t().contiguous()
 c = torch.zeros(M, N, device="cuda", dtype=torch.float32)
 
-a_ = from_dlpack(a)
-b_ = from_dlpack(b)
-bT_ = from_dlpack(bT)
-c_ = from_dlpack(c)
+a_ = from_dlpack(a, assumed_align=16)
+b_ = from_dlpack(b, assumed_align=16)
+bT_ = from_dlpack(b.T, assumed_align=16)
+c_ = from_dlpack(c, assumed_align=16)
 
 naive_matmul = NaiveMatmul()
 tiled_matmul = TiledMatmul(tile_width=16)

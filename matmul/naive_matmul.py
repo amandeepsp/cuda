@@ -1,8 +1,17 @@
 import cutlass.cute as cute
-from typing import no_type_check
+import cutlass
+from typing import no_type_check, Type
 
 
 class NaiveMatmul:
+    def __init__(
+        self,
+        dtype: Type[cutlass.Numeric] = cutlass.Float32,
+        acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
+    ):
+        self.dtype = dtype
+        self.acc_dtype = acc_dtype
+
     @no_type_check
     @cute.kernel
     def _kernel(self, gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
@@ -17,10 +26,10 @@ class NaiveMatmul:
         _, N = gB.shape
 
         if row < M and col < N:
-            acc = cute.Float32(0.0)
+            acc = self.acc_dtype(0.0)
             for k in range(K):
                 acc += gA[row, k] * gB[k, col]
-            gC[row, col] = cute.Float32(acc)
+            gC[row, col] = self.dtype(acc)
 
     @no_type_check
     @cute.jit

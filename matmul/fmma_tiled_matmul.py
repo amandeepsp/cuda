@@ -92,7 +92,7 @@ class FusedTiledMatmul:
         tAcA = thr_copy_A.partition_S(tcA)
         tBcB = thr_copy_B.partition_S(tcB)
         # Allocate predicate tensors for m and n
-        tApA = cute.make_fragment(
+        tApA = cute.make_rmem_tensor(
             cute.make_layout(
                 (
                     tAsA.shape[0][1],
@@ -103,7 +103,7 @@ class FusedTiledMatmul:
             ),
             cutlass.Boolean,
         )
-        tBpB = cute.make_fragment(
+        tBpB = cute.make_rmem_tensor(
             cute.make_layout(
                 (
                     tBsB.shape[0][1],
@@ -115,7 +115,7 @@ class FusedTiledMatmul:
             cutlass.Boolean,
         )
         # Allocate predicate tensors for m, n and k for residue k-tile
-        tApA_residue_k = cute.make_fragment(
+        tApA_residue_k = cute.make_rmem_tensor(
             cute.make_layout(
                 (
                     tAsA.shape[0][1],
@@ -130,7 +130,7 @@ class FusedTiledMatmul:
             ),
             cutlass.Boolean,
         )
-        tBpB_residue_k = cute.make_fragment(
+        tBpB_residue_k = cute.make_rmem_tensor(
             cute.make_layout(
                 (
                     tBsB.shape[0][1],
@@ -215,7 +215,7 @@ class FusedTiledMatmul:
         # Epilogue: copy accumulator to global memory with predication for m and n bounds
         cC = cute.make_identity_tensor(gC.shape)
         tCpC = thr_mma.partition_C(cC)
-        predC = cute.make_fragment(tCrC.layout, cutlass.Boolean)
+        predC = cute.make_rmem_tensor(tCrC.layout, cutlass.Boolean)
         residue_m = mC.shape[0] - self.b_m * bidx
         residue_n = mC.shape[1] - self.b_n * bidy
         for i in range(cute.size(tCrC.shape)):

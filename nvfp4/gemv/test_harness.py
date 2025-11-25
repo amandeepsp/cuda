@@ -1,7 +1,7 @@
 import torch
 from task import TestSpec
 from reference import ref_kernel, generate_input
-from base import custom_kernel
+from attempt1 import custom_kernel
 
 torch.cuda.set_device(0)
 
@@ -71,23 +71,25 @@ def main():
     """
     Main function to run all tests.
     """
-    test_specs = [
-        {"m": 128, "k": 256, "l": 1, "seed": 1111},
-        {"m": 128, "k": 1536, "l": 1, "seed": 1111},
-        {"m": 128, "k": 3072, "l": 1, "seed": 1111},
-        {"m": 256, "k": 7168, "l": 1, "seed": 1111},
-        {"m": 2432, "k": 4608, "l": 2, "seed": 1111},
-        {"m": 384, "k": 7168, "l": 2, "seed": 1111},
-        {"m": 512, "k": 512, "l": 2, "seed": 1111},
-        {"m": 512, "k": 4096, "l": 2, "seed": 1111},
-        {"m": 512, "k": 1536, "l": 2, "seed": 1111},
-    ]
-
     # test_specs = [
-    #     {"m": 7168, "k": 16384, "l": 1, "seed": 1111},
-    #     {"m": 4096, "k": 7168, "l": 8, "seed": 1111},
-    #     {"m": 7168, "k": 2048, "l": 4, "seed": 1111},
+    #     {"m": 128, "k": 256, "l": 1, "seed": 1111},
+    #     {"m": 128, "k": 1536, "l": 1, "seed": 1111},
+    #     {"m": 128, "k": 3072, "l": 1, "seed": 1111},
+    #     {"m": 256, "k": 7168, "l": 1, "seed": 1111},
+    #     {"m": 2432, "k": 4608, "l": 2, "seed": 1111},
+    #     {"m": 384, "k": 7168, "l": 2, "seed": 1111},
+    #     {"m": 512, "k": 512, "l": 2, "seed": 1111},
+    #     {"m": 512, "k": 4096, "l": 2, "seed": 1111},
+    #     {"m": 512, "k": 1536, "l": 2, "seed": 1111},
     # ]
+
+    test_specs = [
+        {"m": 7168, "k": 16384, "l": 1, "seed": 1111},
+        {"m": 4096, "k": 7168, "l": 8, "seed": 1111},
+        {"m": 7168, "k": 2048, "l": 4, "seed": 1111},
+        {"m": 4608, "k": 2432, "l": 2, "seed": 1111},
+        {"m": 7168, "k": 384, "l": 2, "seed": 1111}
+    ]
 
     for spec in test_specs:
         run_test(spec)  # type: ignore

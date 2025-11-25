@@ -19,3 +19,6 @@ explicit = true
 
 [tool.pyright]
 typeCheckingMode = "basic"
+reportAssignmentType = false
+reportArgumentType = false
+reportPrivateImportUsage = false

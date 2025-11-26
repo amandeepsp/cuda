@@ -1,7 +1,7 @@
 import torch
 from task import TestSpec
 from reference import ref_kernel, generate_input
-from attempt1 import custom_kernel
+from attempt3 import custom_kernel
 
 torch.cuda.set_device(0)
 
@@ -62,7 +62,7 @@ def run_test(spec: TestSpec, warmup_rounds: int = 1):
         # print("Custom output:", custom_output)
 
     # Report performance
-    # print(f"Reference kernel time: {ref_time_us:.2f} us")
+    #print(f"Reference kernel time: {ref_time_us:.2f} us")
     print(f"Custom kernel time: {custom_time_us:.2f} us")
     print("---")
 

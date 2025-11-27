@@ -1,6 +1,6 @@
 from task import input_t, output_t
-from typing import Type, Tuple, Union, Callable
-import math
+from typing import Type, Tuple, Union
+import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -9,23 +9,27 @@ from cutlass.cute.typing import Pointer
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.runtime import make_ptr
 
+from cutlass import Float32
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import nvvm, llvm
+
+@dsl_user_op
+def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
+    nvvm.atomicrmw(
+        res=T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value()
+    )
+
+
 def cdiv(a, b):
     return (a + b - 1) // b
-
-@cute.jit
-def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
-    """ Convert a scalar to a cute TensorSSA of shape (1,) and given dtype """
-    vec = cute.make_rmem_tensor(1, dtype)
-    vec[0] = a
-    return vec.load()
 
 
 class BlockScaledGemv:
     def __init__(
         self,
-        b_k: int = 256,
-        threads_per_k: int = 8,
+        block_tiler_mnk: Tuple[int, int, int],
         sf_vec_size: int = 16,
+        num_threads_per_cta=128,
         ab_dtype: Type[cute.Numeric] = cute.Float4E2M1FN,
         sf_dtype: Type[cute.Numeric] = cute.Float8E4M3FN,
         c_dtype: Type[cute.Numeric] = cute.Float16,
@@ -33,10 +37,10 @@ class BlockScaledGemv:
         self.sf_dtype = sf_dtype
         self.ab_dtype = ab_dtype
         self.c_dtype = c_dtype
-        self.threads_per_m = 32
-        self.threads_per_k = threads_per_k
-        self.block_tiler_mnk = (self.threads_per_m, 1, b_k)
+        self.b_m, self.b_n, self.b_k = block_tiler_mnk
+        self.block_tiler_mnk = block_tiler_mnk
         self.sf_vec_size = sf_vec_size
+        self.num_threads_per_cta = num_threads_per_cta
 
         self.n_padded = 128
 
@@ -86,7 +90,7 @@ class BlockScaledGemv:
         )
         sfb_tensor = cute.make_tensor(sfb_ptr, sfb_layout)
 
-        grid = (cdiv(m, self.threads_per_m), 1, l)
+        grid = (cdiv(m, self.b_m), cdiv(k, self.b_k), l)
 
         self._kernel(
             a_tensor,
@@ -94,7 +98,7 @@ class BlockScaledGemv:
             sfa_tensor,
             sfb_tensor,
             c_tensor,
-        ).launch(grid=grid, block=(self.threads_per_m, self.threads_per_k, 1), stream=stream)
+        ).launch(grid=grid, block=(self.num_threads_per_cta, 1, 1), stream=stream)
 
     @cute.kernel
     def _kernel(
@@ -106,7 +110,7 @@ class BlockScaledGemv:
         c: cute.Tensor,
     ):
         bidx, bidy, bidz = cute.arch.block_idx()
-        tidx, tidy, _ = cute.arch.thread_idx()
+        tidx, _, _ = cute.arch.thread_idx()
 
         M = cute.size(a, mode=[0])
         K = cute.size(a, mode=[1])
@@ -117,18 +121,16 @@ class BlockScaledGemv:
         mSFB = sfb[None, None, bidz]
         mC = c[None, None, bidz]
 
-        cta_coord = (bidx, bidy, None)
+        cta_coord = (bidx, 0, bidy)
         gA = cute.local_tile(mA, self.block_tiler_mnk, cta_coord, proj=(1, None, 1))
         gSFA = cute.local_tile(mSFA, self.block_tiler_mnk, cta_coord, proj=(1, None, 1))
         gB = cute.local_tile(mB, self.block_tiler_mnk, cta_coord, proj=(None, 1, 1))
         gSFB = cute.local_tile(mSFB, self.block_tiler_mnk, cta_coord, proj=(None, 1, 1))
         gC = cute.local_tile(mC, self.block_tiler_mnk, cta_coord, proj=(1, 1, None))
 
-        allocator = cutlass.utils.SmemAllocator()
-        smem_layout = cute.make_layout((self.threads_per_m, self.threads_per_k), stride = (self.threads_per_k, 1))
-        shared_res = allocator.allocate_tensor(element_type=cutlass.Float32, layout=smem_layout)
+        tidx = cute.assume(tidx, 8)
 
-        global_m = bidx * self.threads_per_m + tidx
+        global_m = bidx * self.b_m + tidx
 
         if global_m < M:
             # Select output element corresponding to this thread and block indices
@@ -136,57 +138,46 @@ class BlockScaledGemv:
             tCgC = cute.make_tensor(tCgC.iterator, 1)
             tCrC = cute.zeros_like(tCgC, cutlass.Float32)
 
-            k_tiles = cute.size(gA, mode=[2])
-            for k in range(tidy, k_tiles, self.threads_per_k):
-                tAgA = gA[tidx, None, k]
-                tBgB = gB[0, None, k]
-                tAgSFA = gSFA[tidx, None, k]
-                tBgSFB = gSFB[0, None, k]
+            tAgA = gA[tidx, None]
+            tBgB = gB[0, None]
+            tAgSFA = gSFA[tidx, None]
+            tBgSFB = gSFB[0, None]
 
-                tArA = cute.make_rmem_tensor_like(tAgA, cutlass.Float16)
-                tBrB = cute.make_rmem_tensor_like(tBgB, cutlass.Float16)
-                tArSFA = cute.make_rmem_tensor_like(tAgSFA, cutlass.Float32)
-                tBrSFB = cute.make_rmem_tensor_like(tBgSFB, cutlass.Float32)
+            tArA = cute.make_rmem_tensor_like(tAgA, cutlass.Float16)
+            tBrB = cute.make_rmem_tensor_like(tBgB, cutlass.Float16)
+            tArSFA = cute.make_rmem_tensor_like(tAgSFA, cutlass.Float32)
+            tBrSFB = cute.make_rmem_tensor_like(tBgSFB, cutlass.Float32)
 
-                tABrAB = cute.make_rmem_tensor_like(tAgA, cutlass.Float16)
-                tSFrSF = cute.make_rmem_tensor_like(tAgSFA, cutlass.Float32)
+            tABrAB = cute.make_rmem_tensor_like(tAgA, cutlass.Float16)
+            tSFrSF = cute.make_rmem_tensor_like(tAgSFA, cutlass.Float32)
 
-                # Load NVFP4 or FP8 values from global memory
-                a_val_nvfp4 = tAgA.load()
-                b_val_nvfp4 = tBgB.load()
-                sfa_val_fp8 = tAgSFA.load()
-                sfb_val_fp8 = tBgSFB.load()
+            # Load NVFP4 or FP8 values from global memory
+            a_val_nvfp4 = tAgA.load()
+            b_val_nvfp4 = tBgB.load()
+            sfa_val_fp8 = tAgSFA.load()
+            sfb_val_fp8 = tBgSFB.load()
 
-                # Convert loaded values to float32 for computation (FFMA)
-                a_val = a_val_nvfp4.to(cutlass.Float16)
-                b_val = b_val_nvfp4.to(cutlass.Float16)
-                sfa_val = sfa_val_fp8.to(cutlass.Float32)
-                sfb_val = sfb_val_fp8.to(cutlass.Float32)
+            # Convert loaded values to float32 for computation (FFMA)
+            a_val = a_val_nvfp4.to(cutlass.Float16)
+            b_val = b_val_nvfp4.to(cutlass.Float16)
+            sfa_val = sfa_val_fp8.to(cutlass.Float32)
+            sfb_val = sfb_val_fp8.to(cutlass.Float32)
 
-                # Store the converted values to RMEM CuTe tensors
-                tArA.store(a_val)
-                tBrB.store(b_val)
-                tArSFA.store(sfa_val)
-                tBrSFB.store(sfb_val)
+            # Store the converted values to RMEM CuTe tensors
+            tArA.store(a_val)
+            tBrB.store(b_val)
+            tArSFA.store(sfa_val)
+            tBrSFB.store(sfb_val)
 
-                tABrAB.store(tArA.load() * tBrB.load())
-                tSFrSF.store(tArSFA.load() * tBrSFB.load())
+            tABrAB.store(tArA.load() * tBrB.load())
+            tSFrSF.store(tArSFA.load() * tBrSFB.load())
 
-                for i in cutlass.range_constexpr(self.block_tiler_mnk[2]):
-                    global_k = bidy * self.threads_per_k + i
-                    if global_k < K:
-                        tCrC += tABrAB[i] * tSFrSF[i]
-            
-            shared_res[(tidx, tidy)] = tCrC[0]
-            cute.arch.sync_threads()
+            for i in cutlass.range_constexpr(self.block_tiler_mnk[2]):
+                global_k = bidy * self.b_k + i
+                if global_k < K:
+                    tCrC += tABrAB[i] * tSFrSF[i]
 
-            # Thread with tidy == 0 now holds the final reduction result for this tidx
-            if tidy == 0:
-                out = cute.zeros_like(tCgC, cute.Float32)
-                for i in cutlass.range_constexpr(self.threads_per_k):
-                    out += shared_res[(tidx, i)]
-                tCgC.store(out.to(cutlass.Float16))
-            
+            atomic_add_fp32(tCrC[0], tCgC.iterator)
 
 
 # Global cache for compiled kernel
@@ -222,13 +213,14 @@ def custom_kernel(data: input_t) -> output_t:
 
     stream = cutlass_torch.default_stream()
 
-    gemm = BlockScaledGemv()
+    gemm = BlockScaledGemv(block_tiler_mnk=(128, 128, 512), num_threads_per_cta=128)
 
     if _compiled_kernel_cache is None:
         # Create CuTe pointers for A/B/C/SFA/SFB via torch tensor data pointer
         a_ptr = make_ptr(gemm.ab_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
         b_ptr = make_ptr(gemm.ab_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
-        c_ptr = make_ptr(gemm.c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+        # Use Float32 for output since atomic_add_fp32 writes float32
+        c_ptr = make_ptr(cutlass.Float32, 0, cute.AddressSpace.gmem, assumed_align=16)
         sfa_ptr = make_ptr(gemm.sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=32)
         sfb_ptr = make_ptr(gemm.sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=32)
 
@@ -253,8 +245,13 @@ def custom_kernel(data: input_t) -> output_t:
     b_ptr = make_ptr(
         gemm.ab_dtype, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
     )
+
+    c = c.to(torch.float32)
+    c.zero_()  # Zero out before atomic adds
+
+    # Use Float32 for output since atomic_add_fp32 writes float32
     c_ptr = make_ptr(
-        gemm.c_dtype, c.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        cutlass.Float32, c.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
     )
     sfa_ptr = make_ptr(
         gemm.sf_dtype, sfa_permuted.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
@@ -266,4 +263,4 @@ def custom_kernel(data: input_t) -> output_t:
     # Execute the compiled kernel
     _compiled_kernel_cache(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (m, n, k, l), stream)
 
-    return c  # type: ignore
+    return c.to(torch.float16) # type: ignore

@@ -1,7 +1,7 @@
 import torch
 from task import TestSpec
 from reference import ref_kernel, generate_input
-from attempt4 import custom_kernel
+from attempt12 import custom_kernel
 
 torch.cuda.set_device(0)
 
